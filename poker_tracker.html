@@ -108,6 +108,10 @@ textarea { width: 100%; border: 1.5px solid var(--border2); border-radius: var(-
 textarea:focus { outline: none; border-color: var(--blue); box-shadow: var(--shadow-ring); }
 .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 20px; border-radius: 20px; font-size: 14px; z-index: 999; opacity: 0; transition: opacity .3s; pointer-events: none; }
 .toast.show { opacity: 1; }
+.graph-wrap { width: 100%; overflow-x: auto; }
+canvas { display: block; }
+.del-sess { padding: 5px 10px; font-size: 12px; border: 1.5px solid var(--red); border-radius: 6px; background: transparent; color: var(--red); cursor: pointer; }
+.del-sess:active { background: var(--red-light); }
 </style>
 </head>
 <body>
@@ -289,6 +293,10 @@ textarea:focus { outline: none; border-color: var(--blue); box-shadow: var(--sha
   </div>
   <div class="card"><h3>Bankroll</h3><div id="bkroll"></div></div>
   <hr class="divider">
+  <div class="card">
+    <h3>P&L over time</h3>
+    <div class="graph-wrap"><canvas id="pnl-canvas" height="180"></canvas></div>
+  </div>
   <div class="card">
     <h3>Previous sessions</h3>
     <div id="prev-sess-list"><div style="color:var(--text3);font-size:14px">No previous sessions yet.</div></div>
@@ -631,7 +639,7 @@ function handRow(h,sessId){
   </div>`;
 }
 
-function renderSessionTab(){renderStats();renderBankroll();renderPrevSessions();}
+function renderSessionTab(){renderStats();renderBankroll();renderPrevSessions();setTimeout(renderPnlGraph,50);}
 function renderBankroll(){
   const init=G.totalBuyin-G.rebuys.reduce((a,b)=>a+b,0),pnl=calcPnl();
   document.getElementById('bkroll').innerHTML=`
@@ -648,11 +656,162 @@ function renderPrevSessions(){
   el.innerHTML=past.map((sess,i)=>{
     const pnl=sess.stack-sess.totalBuyin,d=new Date(sess.start);
     const lbl=d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    return `<div class="sess-row" onclick="openPastSess('${sess.id}')">
-      <div><div style="font-weight:600;font-size:14px">Session ${past.length-i}</div><div style="font-size:12px;color:var(--text3)">${lbl} · ${sess.hands.length} hands</div></div>
-      <div style="text-align:right;font-weight:600;font-size:16px" class="${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl}</div>
+    return `<div class="sess-row">
+      <div onclick="openPastSess('${sess.id}')" style="flex:1">
+        <div style="font-weight:600;font-size:14px">Session ${past.length-i}</div>
+        <div style="font-size:12px;color:var(--text3)">${lbl} · ${sess.hands.length} hands</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="text-align:right;font-weight:600;font-size:16px" class="${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl}</div>
+        <button class="del-sess" data-sid="${sess.id}" data-confirming="0" onclick="deleteSession('${sess.id}')">Delete</button>
+      </div>
     </div>`;
   }).join('');
+}
+
+function deleteSession(sessId){
+  // Find the delete button and replace with inline confirm
+  const allBtns=document.querySelectorAll('.del-sess');
+  allBtns.forEach(btn=>{
+    if(btn.getAttribute('data-sid')===String(sessId)){
+      // Already showing confirm? Then execute delete
+      if(btn.getAttribute('data-confirming')==='1'){
+        allSessions=allSessions.filter(s=>String(s.id)!==String(sessId));
+        saveToStorage();
+        renderPrevSessions();
+        renderPnlGraph();
+        showToast('Session deleted');
+      } else {
+        // First tap — show confirm state
+        btn.setAttribute('data-confirming','1');
+        btn.textContent='Tap again to confirm';
+        btn.style.fontSize='11px';
+        btn.style.borderColor='#A32D2D';
+        btn.style.background='var(--red-light)';
+        btn.style.color='var(--red)';
+        // Reset after 3 seconds if not confirmed
+        setTimeout(()=>{
+          if(btn.getAttribute('data-confirming')==='1'){
+            btn.setAttribute('data-confirming','0');
+            btn.textContent='Delete';
+            btn.style.fontSize='';
+            btn.style.background='transparent';
+          }
+        },3000);
+      }
+    }
+  });
+}
+
+function renderPnlGraph(){
+  const canvas=document.getElementById('pnl-canvas');
+  if(!canvas)return;
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  const W=canvas.parentElement.clientWidth||300;
+  canvas.width=W*dpr;
+  canvas.height=180*dpr;
+  canvas.style.width=W+'px';
+  canvas.style.height='180px';
+  ctx.scale(dpr,dpr);
+
+  // Gather all completed sessions sorted by date ascending
+  const past=[...allSessions].filter(s=>!s.active).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  // Add current session as last point if active
+  const points=[];
+  let running=0;
+  // Start at 0
+  points.push({label:'Start',val:0});
+  past.forEach((sess,i)=>{
+    running+=sess.stack-sess.totalBuyin;
+    const d=new Date(sess.start);
+    points.push({label:d.toLocaleDateString([],{month:'short',day:'numeric'}),val:running});
+  });
+  // Add current session live
+  if(G.sessId){
+    running+=calcPnl();
+    points.push({label:'Now',val:running});
+  }
+
+  if(points.length<2){
+    ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--text3')||'#999';
+    ctx.font='14px -apple-system,sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('Complete a session to see your graph',W/2,90);
+    return;
+  }
+
+  const pad={top:20,right:16,bottom:36,left:52};
+  const gW=W-pad.left-pad.right;
+  const gH=180-pad.top-pad.bottom;
+
+  const vals=points.map(p=>p.val);
+  const minV=Math.min(...vals,0);
+  const maxV=Math.max(...vals,0);
+  const range=maxV-minV||1;
+
+  const toX=i=>pad.left+(i/(points.length-1))*gW;
+  const toY=v=>pad.top+gH-(((v-minV)/range)*gH);
+
+  // Grid lines
+  const isDark=window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const gridColor=isDark?'rgba(255,255,255,0.08)':'rgba(0,0,0,0.07)';
+  const textColor=isDark?'#636366':'#999';
+  const zeroColor=isDark?'rgba(255,255,255,0.2)':'rgba(0,0,0,0.15)';
+  const lineColor='#185FA5';
+  const posColor='#3B6D11';
+  const negColor='#A32D2D';
+
+  // Draw horizontal grid lines
+  ctx.strokeStyle=gridColor;
+  ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const y=pad.top+(i/4)*gH;
+    ctx.beginPath();ctx.moveTo(pad.left,y);ctx.lineTo(pad.left+gW,y);ctx.stroke();
+    const labelVal=maxV-((maxV-minV)/4)*i;
+    ctx.fillStyle=textColor;ctx.font='10px -apple-system,sans-serif';ctx.textAlign='right';
+    ctx.fillText((labelVal>=0?'+':'')+Math.round(labelVal),pad.left-5,y+4);
+  }
+
+  // Zero line
+  if(minV<0&&maxV>0){
+    const zy=toY(0);
+    ctx.strokeStyle=zeroColor;ctx.lineWidth=1.5;ctx.setLineDash([4,3]);
+    ctx.beginPath();ctx.moveTo(pad.left,zy);ctx.lineTo(pad.left+gW,zy);ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Fill under the line
+  ctx.beginPath();
+  ctx.moveTo(toX(0),toY(0));
+  points.forEach((p,i)=>ctx.lineTo(toX(i),toY(p.val)));
+  ctx.lineTo(toX(points.length-1),toY(0));
+  ctx.closePath();
+  const finalVal=points[points.length-1].val;
+  ctx.fillStyle=finalVal>=0?'rgba(59,109,17,0.12)':'rgba(163,45,45,0.12)';
+  ctx.fill();
+
+  // Draw line
+  ctx.beginPath();
+  ctx.strokeStyle=lineColor;ctx.lineWidth=2.5;ctx.lineJoin='round';
+  points.forEach((p,i)=>{if(i===0)ctx.moveTo(toX(i),toY(p.val));else ctx.lineTo(toX(i),toY(p.val));});
+  ctx.stroke();
+
+  // Dots
+  points.forEach((p,i)=>{
+    ctx.beginPath();
+    ctx.arc(toX(i),toY(p.val),4,0,Math.PI*2);
+    ctx.fillStyle=p.val>=0?posColor:negColor;
+    ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();
+  });
+
+  // X labels — only first, last, and middle to avoid crowding
+  ctx.fillStyle=textColor;ctx.font='10px -apple-system,sans-serif';ctx.textAlign='center';
+  const labelIdx=new Set([0,Math.floor((points.length-1)/2),points.length-1]);
+  labelIdx.forEach(i=>{
+    ctx.fillText(points[i].label,toX(i),180-pad.bottom+14);
+  });
 }
 function openPastSess(sessId){
   const sess=allSessions.find(s=>String(s.id)===String(sessId));if(!sess)return;
